@@ -5,7 +5,7 @@ import os
 import os.path as osp
 import time
 import warnings
-
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import mmcv
 import torch
 import torch.distributed as dist
@@ -23,7 +23,7 @@ from mmseg.utils import (collect_env, get_device, get_root_logger,
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a segmentor')
-    parser.add_argument('config', help='train config file path')
+    parser.add_argument('--config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--load-from', help='the checkpoint file to load weights from')
@@ -104,7 +104,8 @@ def parse_args():
         warnings.warn('--options is deprecated in favor of --cfg-options. '
                       '--options will not be supported in version v0.22.0.')
         args.cfg_options = args.options
-
+    args.config ="./configs/zegclip/sszegclip-20k_voc-512x512.py"# "./configs/maskformer/maskformer_r50-d32_8xb2-20k_voc-512x512.py"#
+    args.work_dir = "./work_dirs/ss_zegclip_voc_zero_run1"
     return args
 
 
