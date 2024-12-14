@@ -115,6 +115,8 @@ data
 *.log.json
 work_dirs/
 mmseg/.mim
+configs/zegclip/
+configs/_base_/
 
 # Pytorch
 *.pth
