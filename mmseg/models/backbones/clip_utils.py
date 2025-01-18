@@ -4,8 +4,20 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from timm.models.layers import drop, drop_path, trunc_normal_
 
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
 
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+    
+    def extra_repr(self) -> str:
+        return 'p={}'.format(self.drop_prob)
 # implement attention module for v-v self-attention
 class VV_Attention(nn.Module):
     def __init__(self, out_dim, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., settings=''):
@@ -56,7 +68,7 @@ class VV_Attention(nn.Module):
 
 
 class VV_AttentionPool2d(nn.Module):
-    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
+    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None,align_corners=False):
         super().__init__()
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
@@ -69,9 +81,10 @@ class VV_AttentionPool2d(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.output_dim = output_dim
-
+        self.align_corners=align_corners
 
     def forward(self, x):
+        B, C, H, W = x.shape
         # reform transformer layer after init and load weights, using v only
         if self.attn == None:
             self.attn = VV_Attention(self.output_dim, self.embed_dim, self.num_heads, True)
@@ -83,17 +96,22 @@ class VV_AttentionPool2d(nn.Module):
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
 
-        side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
-        new_side = int((x.shape[0] - 1) ** 0.5)
+        # side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
+        # new_side = int((x.shape[0] - 1) ** 0.5)
 
-        # update the position embedding during inference for varied input size
-        if side != new_side:
-            new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
-            new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
-            new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
-            self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
+        # # update the position embedding during inference for varied input size
+        # if side != new_side:
+        #     new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
+        #     new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
+        #     new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
+        #     self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
+        # x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        cls_pos = self.positional_embedding[0:1, :]
+        spatial_pos = F.interpolate(self.positional_embedding[1:,].reshape(1, self.spacial_dim, self.spacial_dim, self.embed_dim).permute(0, 3, 1, 2), size=(H, W), mode='bilinear',align_corners=self.align_corners)
+        spatial_pos = spatial_pos.reshape(self.embed_dim, H*W).permute(1, 0)
+        positional_embedding = torch.cat([cls_pos, spatial_pos], dim=0)
 
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        x = x + positional_embedding[:, None, :].to(x.dtype)
         x, x_ori = self.attn(x.transpose(0, 1))
 
         # cls token from the original path, and img tokens from the new path
@@ -160,20 +178,28 @@ class AttentionPool2d(nn.Module):
         self.num_heads = num_heads
 
     def forward(self, x):
+        B, C, H, W = x.shape
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
 
-        side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
-        new_side = int((x.shape[0] - 1) ** 0.5)
+        # side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
+        # new_side = int((x.shape[0] - 1) ** 0.5)
 
-        # update the position embedding during inference for varied input size
-        if side != new_side:
-            new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
-            new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
-            new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
-            self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
+        # # update the position embedding during inference for varied input size
+        # if side != new_side:
+        #     new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
+        #     new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
+        #     new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
+        #     self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
 
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        # x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+
+        cls_pos = self.positional_embedding[0:1, :]
+        spatial_pos = F.interpolate(self.positional_embedding[1:,].reshape(1, self.spacial_dim, self.spacial_dim, self.embed_dim).permute(0, 3, 1, 2), size=(H, W), mode='bilinear')
+        spatial_pos = spatial_pos.reshape(self.embed_dim, H*W).permute(1, 0)
+        positional_embedding = torch.cat([cls_pos, spatial_pos], dim=0)
+
+        x = x + positional_embedding[:, None, :]
         x, _ = F.multi_head_attention_forward(
             query=x, key=x, value=x,
             embed_dim_to_check=x.shape[-1],
@@ -213,7 +239,7 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, need_weights: bool = False):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, need_weights: bool = False, drop_path=0.):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
@@ -226,6 +252,7 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
         self.need_weights = need_weights
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
@@ -328,21 +355,23 @@ class ResidualAttentionBlock_TPT(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, need_weights: bool = False,
-                design_details = None):
+                design_details = None,is_text_encoder=False, drop_path_rate=0.):
         super().__init__()
         self.width = width
         self.layers = layers
         self.design_details = design_details
+        self.is_text_encoder = is_text_encoder
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, layers)] 
         # dpr = [x.item() for x in torch.linspace(0, drop_path_rate, layers)]  # stochastic depth decay rule
         if design_details: # Textual prompt tuning hyper-parameters, only for text encoder
             self.resblocks = nn.ModuleList([ResidualAttentionBlock_TPT(width, heads, attn_mask, need_weights=need_weights if i == layers - 1 else False, 
                                                                         design_details=design_details, i=i) for i in range(layers)])
         else:
             # self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask,) for i in range(layers)])
-            self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask, need_weights=need_weights if i == layers - 1 else False) for i in range(layers)])
+            self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask, need_weights=need_weights if i == layers - 1 else False, drop_path=dpr[i]) for i in range(layers)])
 
     def forward(self, x: torch.Tensor,out_layers:list=None):
-        if self.design_details is None:
+        if not self.is_text_encoder:
             out_tokens = []
             for i,r in enumerate(self.resblocks):
                 x = r(x)
@@ -351,12 +380,21 @@ class Transformer(nn.Module):
                         out_tokens.append(x[0])
                     else:
                         out_tokens.append(x)
-            return x, out_tokens
+            if out_layers==None:
+                if isinstance(x, list):
+                    out_tokens.append(x[0])
+                else:
+                    out_tokens.append(x)
+            return out_tokens
         # insert learnable text embedding
         else:
             for r in self.resblocks:
                 x = r(x)
-            return x[0]
+            if isinstance(x, list):
+                return x[0]
+            else:
+                return x
+
     def multi_feat_forward(self,x:torch.Tensor,out_layers:list):
         out_tokens = []
         for i,r in enumerate(self.resblocks):

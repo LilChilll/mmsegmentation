@@ -1,12 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import functools
-
 import mmcv
 import numpy as np
 import torch
 import torch.nn.functional as F
+import math
+import torch.nn as nn
+from timm.models.layers import trunc_normal_
 
-
+from scipy.ndimage.morphology import distance_transform_edt
 def get_class_weight(class_weight):
     """Get class weight for loss function.
 
@@ -124,3 +126,93 @@ def weighted_loss(loss_func):
         return loss
 
     return wrapper
+
+def mask_to_onehot(mask, gt_cls):
+    # mask = mask.cpu()
+    _mask = [mask == i for i in gt_cls]
+    return np.array(_mask).astype(np.uint8)
+
+def onehot_to_binary_edges(mask, radius, gt_cls):
+    mask_pad = np.pad(mask, ((0, 0), (1, 1), (1, 1)), mode='constant', constant_values=0)
+    edgemap = np.zeros(mask.shape[1:])
+    for i,cls in enumerate(gt_cls):
+        dist = distance_transform_edt(mask_pad[i, :]) + distance_transform_edt(1.0 - mask_pad[i, :])
+        dist = dist[1:-1, 1:-1]
+        dist[dist > radius] = 0
+        edgemap += dist
+    edgemap = np.expand_dims(edgemap, axis=0)
+    edgemap = (edgemap > 0).astype(np.uint8)
+    return edgemap
+
+class Flatten(nn.Module):
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, feat):
+        return feat.view(feat.size(0), -1)
+
+
+class InverseNet(nn.Module):
+    def __init__(self,pretrained=None):
+        super(InverseNet, self).__init__()
+        # Regressor for the 3 * 2 affine matrix
+        self.fc = nn.Sequential(
+            nn.Linear(224*224*2, 1000),
+            nn.ReLU(True),
+            nn.Linear(1000, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 4)
+        )
+        # self.apply(self._init_weights)
+        self.pretrained = pretrained
+        self.init_weight()
+
+    def init_weight(self, pretrained=None):
+        # pretrained_dict = torch.load(pretrained, map_location=torch.device('cpu'))
+        pretrained = pretrained if pretrained else self.pretrained
+        if pretrained:
+            pretrained_dict = torch.load(pretrained)
+            
+            model_dict = self.state_dict()
+            updated_model_dict = {}
+            for k_model, v_model in model_dict.items():
+                if k_model.startswith('model') or k_model.startswith('module'):
+                    k_updated = '.'.join(k_model.split('.')[1:])
+                    updated_model_dict[k_updated] = k_model
+                else:
+                    updated_model_dict[k_model] = k_model
+
+            updated_pretrained_dict = {}
+            for k, v in pretrained_dict.items():
+                if k.startswith('model') or k.startswith('modules'):
+                    k = '.'.join(k.split('.')[1:])
+                if k in updated_model_dict.keys() and model_dict[k].shape == v.shape:
+                    updated_pretrained_dict[updated_model_dict[k]] = v
+
+            model_dict.update(updated_pretrained_dict)
+            self.load_state_dict(model_dict)
+            print("InverseNet weights loaded.")
+        else:
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    trunc_normal_(m.weight, std=.02)
+                    if isinstance(m, nn.Linear) and m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.LayerNorm):
+                    nn.init.constant_(m.bias, 0)
+                    nn.init.constant_(m.weight, 1.0)
+                elif isinstance(m, nn.Conv2d):
+                    fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                    fan_out //= m.groups
+                    m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+                    if m.bias is not None:
+                        m.bias.data.zero_()
+            print("Warning: InverseNet weights not loaded.")
+
+        
+
+    def forward(self, x1, x2):
+        # Perform the usual forward pass
+        x = torch.cat((x1.view(-1, 224*224),x2.view(-1, 224*224)), dim=1)
+        out=self.fc(x)
+        return x1, x2, out

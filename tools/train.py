@@ -25,7 +25,7 @@ def parse_args():
     debug_config = './configs/zegclip/sszegclip-20k_voc-512x512.py'
     debug_work_dir = './work_dirs/train_debug'
     parser = argparse.ArgumentParser(description='Train a segmentor')
-    parser.add_argument('config', help='train config file path', default=debug_config)
+    parser.add_argument('--config', help='train config file path', default=debug_config)
     parser.add_argument('--work-dir', help='the dir to save logs and models',default=debug_work_dir)
     parser.add_argument(
         '--load-from', help='the checkpoint file to load weights from')
@@ -106,8 +106,9 @@ def parse_args():
         warnings.warn('--options is deprecated in favor of --cfg-options. '
                       '--options will not be supported in version v0.22.0.')
         args.cfg_options = args.options
-    args.config ="./configs/zegclip/sszegclip-20k_voc-512x512.py"# "./configs/maskformer/maskformer_r50-d32_8xb2-20k_voc-512x512.py"#
-    args.work_dir = "./work_dirs/ss_zegclip_voc_zero_run1"
+    args.config ="./configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt.py"# "./configs/zegclip/sszegclip-20k_voc-512x512_zero_prompt_learner.py"#
+    args.work_dir = "./work_dirs/train_debug"
+   
     return args
 
 
@@ -219,10 +220,11 @@ def main():
         val_dataset = copy.deepcopy(cfg.data.val)
         val_dataset.pipeline = cfg.data.train.pipeline
         datasets.append(build_dataset(val_dataset))
-    if cfg.checkpoint_config is not None:
+    checkpoint_config = cfg.checkpoint_config if cfg.checkpoint_config else cfg.custom_hooks[0] # 
+    if checkpoint_config is not None:
         # save mmseg version, config file content and class names in
         # checkpoints as meta data
-        cfg.checkpoint_config.meta = dict(
+        checkpoint_config.meta = dict(
             mmseg_version=f'{__version__}+{get_git_hash()[:7]}',
             config=cfg.pretty_text,
             CLASSES=datasets[0].CLASSES,
@@ -230,7 +232,7 @@ def main():
     # add an attribute for visualization convenience
     model.CLASSES = datasets[0].CLASSES
     # passing checkpoint meta for saving best checkpoint
-    meta.update(cfg.checkpoint_config.meta)
+    meta.update(checkpoint_config.meta)
     train_segmentor(
         model,
         datasets,

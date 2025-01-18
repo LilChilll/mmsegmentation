@@ -25,11 +25,13 @@ from .clip_utils import *
 from .clip_image_encoder import CLIP_surgery_VisionTransformer
 from .clip_text_encoder import DynamicPromptCLIPTextEncoder
 from .prompt_learners import MultiGranularityPromptLearner
+from .utils_zegclip import *
+from .zegclip_image_encoder import VPTCLIPVisionTransformer
 __all__ = [
     'ResNet', 'ResNetV1c', 'ResNetV1d', 'ResNeXt', 'HRNet', 'FastSCNN',
     'ResNeSt', 'MobileNetV2', 'UNet', 'CGNet', 'MobileNetV3',
     'VisionTransformer', 'SwinTransformer', 'MixVisionTransformer',
     'BiSeNetV1', 'BiSeNetV2', 'ICNet', 'TIMMBackbone', 'ERFNet', 'PCPVT',
     'SVT', 'STDCNet', 'STDCContextPathNet', 'BEiT', 'MAE', 'MSCAN','CLIP_surgery_VisionTransformer','DynamicPromptCLIPTextEncoder',
-    'MultiGranularityPromptLearner'
+    'MultiGranularityPromptLearner','VPTCLIPVisionTransformer'
 ]

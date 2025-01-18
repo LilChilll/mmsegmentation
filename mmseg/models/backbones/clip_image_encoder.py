@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 from .clip_utils import *
+# from .zegclip_image_encoder import *
 import torch.nn.functional as F
 from mmseg.models.builder import BACKBONES
 import math
@@ -65,12 +66,13 @@ class CLIP_surgery_VisionTransformer(nn.Module):
                  pretrained=None,
                  align_corners=False,
                  out_indices=[3, 5, 7, 11],
+                 drop_path_rate=0.,
                  attn_surgery = False,
                  vpt_mode = False,
                  num_tokens=20, 
+                 prompt_dim=768,
                  total_d_layer=11,
-                 query_decoder_in_dim=1024,
-                 query_decoder_out_dim=100,
+                 **kwargs
                  ):
         super().__init__()
         self.pretrained = pretrained
@@ -81,28 +83,32 @@ class CLIP_surgery_VisionTransformer(nn.Module):
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
         self.spatial_size = input_resolution // patch_size
+        self.ln_pre = LayerNorm(width)
+        self.layers = layers
 
-        self.transformer = Transformer(width, layers, heads, need_weights=True)
-        self.attn = None
-        self.embed_dim = width
-        self.num_heads = heads
+        self.transformer = Transformer(width, layers, heads, need_weights=False, drop_path_rate=drop_path_rate)
+
+        self.out_indices = out_indices
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
-
+        
         self.align_corners = align_corners
         self.attn_surgery = attn_surgery
-        self.layers = layers
-        self.out_indices = out_indices
         self.vpt_mode = vpt_mode
-        
+
         if self.vpt_mode:
             self.num_tokens = num_tokens
-            self.prompt_dim = width # 768
+            self.prompt_dim = prompt_dim # 768
             self.total_d_layer = total_d_layer
             self.init_prompts(patch_size, num_tokens, self.prompt_dim, total_d_layer)
+        
+        # clip surgery settings
+        self.attn = None
+        self.embed_dim = width
+        self.num_heads = heads
+        # self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         # self.query_decoder_in_dim = query_decoder_in_dim
         # self.query_decoder_out_dim = query_decoder_out_dim
         # self.query_decoder = nn.Sequential(
@@ -132,38 +138,39 @@ class CLIP_surgery_VisionTransformer(nn.Module):
         self.prompt_dropout = Dropout(0.1)
 
     def init_weights(self, pretrained=None):
-            pretrained = pretrained or self.pretrained
-            if isinstance(pretrained, str):
-                checkpoint = torch.jit.load(pretrained, map_location='cpu').float().state_dict()
-                state_dict = {}
-                for k in checkpoint.keys():
-                    if k.startswith('visual.'):
-                        new_k = k.replace('visual.', '')
-                        state_dict[new_k] = checkpoint[k]
+        pretrained = pretrained or self.pretrained
+        if isinstance(pretrained, str):
+            checkpoint = torch.jit.load(pretrained, map_location='cpu').float().state_dict()
+            self.logit_scale = checkpoint['logit_scale']
+            state_dict = {}
+            for k in checkpoint.keys():
+                if k.startswith('visual.'):
+                    new_k = k.replace('visual.', '')
+                    state_dict[new_k] = checkpoint[k]
 
-                if 'positional_embedding' in state_dict.keys():
-                    if self.positional_embedding.shape != state_dict['positional_embedding'].shape:
-                        # (1025, 768)                      (197, 768)  
-                        print(f'Resize the pos_embed shape from {state_dict["positional_embedding"].shape} to {self.positional_embedding.shape}')
-                        cls_pos = state_dict["positional_embedding"][0:1, :]
-                        
-                        spatial_pos = F.interpolate(state_dict["positional_embedding"][1:,].reshape(1, 14, 14, 768).permute(0, 3, 1, 2), size=(self.spatial_size, self.spatial_size), mode='bilinear',align_corners=self.align_corners)
-                        spatial_pos = spatial_pos.reshape(768, self.spatial_size*self.spatial_size).permute(1, 0)
-                        positional_embedding = torch.cat([cls_pos, spatial_pos], dim=0)
-                        state_dict['positional_embedding'] = positional_embedding
-                        assert self.positional_embedding.shape == state_dict['positional_embedding'].shape
-
-                u, _ = self.load_state_dict(state_dict, False)
-                print(f'pretrained image encoder weight loaded.')
-                if len(u)>0:
-                    print(f'{u} are misaligned params in image encoder')
+            if 'positional_embedding' in state_dict.keys():
+                if self.positional_embedding.shape != state_dict['positional_embedding'].shape:
+                    # (1025, 768)                      (197, 768)  
+                    print(f'Resize the pos_embed shape from {state_dict["positional_embedding"].shape} to {self.positional_embedding.shape}')
+                    cls_pos = state_dict["positional_embedding"][0:1, :]
+                    
+                    spatial_pos = F.interpolate(state_dict["positional_embedding"][1:,].reshape(1, 14, 14, 768).permute(0, 3, 1, 2), size=(self.spatial_size, self.spatial_size), mode='bilinear',align_corners=self.align_corners)
+                    spatial_pos = spatial_pos.reshape(768, self.spatial_size*self.spatial_size).permute(1, 0)
+                    positional_embedding = torch.cat([cls_pos, spatial_pos], dim=0)
+                    state_dict['positional_embedding'] = positional_embedding
+                    assert self.positional_embedding.shape == state_dict['positional_embedding'].shape
+            
+            u, _ = self.load_state_dict(state_dict, False)
+            print(f'pretrained image encoder weight loaded.')
+            if len(u)>0:
+                print(f'{u} are misaligned params in image encoder')
 
     def apply_CLIP_attention_surgery(self):
         # reform the architecture during first inference
         if self.attn == None:
             # apply architecture surgery on the last 6 blocks
             for i in range(1, 7): # surgery 7, maskclip 2
-                self.attn = VV_Attention(self.embed_dim, self.embed_dim, self.num_heads, True)
+                self.attn = VV_Attention(out_dim=self.embed_dim, dim=self.embed_dim, num_heads=self.num_heads, qkv_bias=True)
                 self.attn.qkv.weight.data = self.transformer.resblocks[-i].attn.in_proj_weight.clone()
                 self.attn.qkv.bias.data = self.transformer.resblocks[-i].attn.in_proj_bias.clone()
                 self.attn.proj.weight.data = self.transformer.resblocks[-i].attn.out_proj.weight.clone()
@@ -172,49 +179,114 @@ class CLIP_surgery_VisionTransformer(nn.Module):
             print("CLIP attention surgery applied.")
     
     def forward(self, x: torch.Tensor):
-        if self.attn_surgery:
-            self.apply_CLIP_attention_surgery()
+        # if self.attn_surgery:
+        #     self.apply_CLIP_attention_surgery()
         
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         B, C, H, W = x.shape
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
-        new_side = int((x.shape[1] - 1) ** 0.5)
+        # side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
+        # new_side = int((x.shape[1] - 1) ** 0.5)
 
-        # update the position embedding during inference for varied input size
-        if side != new_side:
-            new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
-            new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
-            new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
-            self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
+        # # update the position embedding during inference for varied input size
+        # if side != new_side:
+        #     new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
+        #     new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
+        #     new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
+        #     self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
 
         pos = self.positional_embedding.to(x.dtype)
+        cls_pos = pos[0,:] + self.class_embedding.to(x.dtype)
+        spatial_pos = F.interpolate(pos[1:,].reshape(1, self.spatial_size, self.spatial_size, C).permute(0, 3, 1, 2), size=(H, W), mode='bilinear')
+        spatial_pos = spatial_pos.reshape(1, C, H*W).permute(0, 2, 1)
+        pos = torch.cat([cls_pos.reshape(1, 1, C), spatial_pos], dim=1)
         x = x + pos
-        x = self.ln_pre(x)
+        x = self.ln_pre(x) # b,1025,768
 
         
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        #TODO uncomment this
         patch_tokens = []
         if self.vpt_mode:
-            assert self.total_d_layer >= 0, "total_d_layer should be greater than or equal to 0"
+            assert self.total_d_layer > 0, "total_d_layer should be greater than or equal to 0"
             # concat prompt
-            temp = self.prompt_dropout(self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1).permute(1,0,2).contiguous())
+            # temp = self.prompt_dropout(self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1).permute(1,0,2).contiguous())
+            # x = torch.cat((
+            #     x[:1,:,  :],
+            #         temp,
+            #         x[1:, :, :]
+            #     ), dim=0) # 1024+1+20,bs,768
+            # concat prompt
             x = torch.cat((
-                x[:1,:,  :],
-                    temp,
-                    x[1:, :, :]
-                ), dim=0) # 1024+1+20,bs,768
-            out_feat,patch_tokens =  self.forward_deep_prompt(x, H, W)
+                x[:, :1, :],
+                    self.prompt_dropout(self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)),
+                    x[:, 1:, :]
+                ), dim=1)
+
+            x = x.permute(1, 0, 2)  # NLD -> LND(1045,b,768)
+            patch_tokens =  self.forward_deep_prompt(x, H, W)
         else:
-            out_feat,patch_tokens = self.transformer(x,self.out_indices)
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            patch_tokens = self.transformer(x,self.out_indices)
+
+
         patch_token_list = []
         for patch_token in patch_tokens:
-            patch_token = self.ln_post(patch_token.permute(1, 0, 2)) @ self.proj  # LND -> NLD
-            patch_token_list.append(patch_token[:,-(H*W):,:].contiguous())
+            patch_token = self.ln_post(patch_token.permute(1, 0, 2).contiguous()) @ self.proj  # LND -> NLD
+            # patch_token = patch_token[:,-(H*W):,:].contiguous()
+            patch_token = patch_token/patch_token.norm(dim=-1, keepdim=True)
+            patch_token_list.append(patch_token)
         patch_tokens = patch_token_list
         
+        # if isinstance(out_feat, list):
+        #     x,x_ori = out_feat
+        #     x[0, :, :] = x_ori[0, :, :] # clip_surgery
+        # else:
+        #     x = out_feat
+        
+        # x = x.permute(1, 0, 2)  # LND -> NLD
+
+        # x = self.ln_post(x)
+        # x = x @ self.proj
+        # global_embedding = x[:, 0] # [b,512]
+        # visual_embedding = x[:, -(H*W):].reshape(B, H, W, -1).permute(0, 3, 1, 2) # [b,512,h,w] 
+        # global_embedding = global_embedding / global_embedding.norm(dim=1, keepdim=True)
+        # visual_embedding = visual_embedding / visual_embedding.norm(dim=1, keepdim=True)
+        return patch_tokens
+        # if len(patch_tokens)>0:
+        #     return global_embedding, visual_embedding, patch_tokens
+        # else:
+        #     return global_embedding, visual_embedding,[visual_embedding]
+    def ori_forward(self, x: torch.Tensor):
+        
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        B, C, H, W = x.shape
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+
+        pos = self.positional_embedding.to(x.dtype)
+        cls_pos = pos[0,:] + self.class_embedding.to(x.dtype)
+        spatial_pos = F.interpolate(pos[1:,].reshape(1, self.spatial_size, self.spatial_size, C).permute(0, 3, 1, 2), size=(H, W), mode='bilinear')
+        spatial_pos = spatial_pos.reshape(1, C, H*W).permute(0, 2, 1)
+        pos = torch.cat([cls_pos.reshape(1, 1, C), spatial_pos], dim=1)
+        x = x + pos
+        x = self.ln_pre(x) # b,1025,768
+
+        
+        # concat prompt
+        # x = torch.cat((
+        #     x[:, :1, :],
+        #         self.prompt_dropout(self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)),
+        #         x[:, 1:, :]
+        #     ), dim=1)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND(1045,b,768)
+     
+        out_feat,_ = self.transformer(x)
+
         if isinstance(out_feat, list):
             x,x_ori = out_feat
             x[0, :, :] = x_ori[0, :, :] # clip_surgery
@@ -222,16 +294,14 @@ class CLIP_surgery_VisionTransformer(nn.Module):
             x = out_feat
         
         x = x.permute(1, 0, 2)  # LND -> NLD
-
         x = self.ln_post(x)
         x = x @ self.proj
-
         global_embedding = x[:, 0] # [b,512]
         visual_embedding = x[:, -(H*W):].reshape(B, H, W, -1).permute(0, 3, 1, 2) # [b,512,h,w] 
+        global_embedding = global_embedding / global_embedding.norm(dim=1, keepdim=True)
+        visual_embedding = visual_embedding / visual_embedding.norm(dim=1, keepdim=True)
 
-        # query = self.query_decoder(x[:, -(H*W):,:].permute(0,2,1).contiguous())
-        # query = query.permute(0,2,1).contiguous() # [2,100,512]
-        return global_embedding, visual_embedding, patch_tokens#,query
+        return global_embedding, visual_embedding
     
     def forward_deep_prompt(self, input_feat, H, W):
         out_tokens = []
@@ -284,23 +354,27 @@ class CLIP_surgery_VisionTransformer(nn.Module):
                         hidden_states[-(H*W):, :, :]
                     ), dim=0)
                 hidden_states = self.transformer.resblocks[i](hidden_states)
-            if i in self.out_indices:
+            if i in self.out_indices: # len(self.out_indices) > 1 and 
                 if isinstance(hidden_states, list):
                     x,x_ori = hidden_states
                     x[0, :, :] = x_ori[0, :, :]
                     feat = x
                 else:
                     feat = hidden_states
-                feat = feat[-(H * W):,:, :].contiguous() # 1024,b,512
+                feat = self.prompt_norm(feat)
+                feat = torch.cat((
+                        feat[:1, :, :],
+                        feat[-(H*W):, :, :]
+                    ), dim=0)#feat[-(H * W):,:, :].contiguous() # 1024,b,768
                 out_tokens.append(feat)
                 j+=1
         # multi_scale_features= torch.stack(multi_scale_features,dim=0) # l,1024,b,512
         # multi_scale_features = multi_scale_features.permute(2,0,3,1).contiguous() # b,l,512,1024
-        if isinstance(hidden_states, list):
-            output =[self.prompt_norm(hidden_states[0]),self.prompt_norm(hidden_states[1])]
-        else:
-            output = self.prompt_norm(hidden_states)
-        return output, out_tokens
+        # if isinstance(hidden_states, list):
+        #     output =[self.prompt_norm(hidden_states[0]),self.prompt_norm(hidden_states[1])]
+        # else:
+        #     output = self.prompt_norm(hidden_states)
+        return out_tokens
 
 # @BACKBONES.register_module()
 class CLIP_plain_VisionTransformer(nn.Module):

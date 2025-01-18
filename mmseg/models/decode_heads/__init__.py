@@ -30,6 +30,9 @@ from .setr_up_head import SETRUPHead
 from .stdc_head import STDCHead
 from .uper_head import UPerHead
 from .atm_single_seg_head import ATMSingleHeadSeg
+from .boundary_head import BoundaryDecodeHead
+from .clip_cls_head import CLIPClassificationHead
+# from .maskformer_head import MaskFormerHead
 __all__ = [
     'FCNHead', 'PSPHead', 'ASPPHead', 'PSAHead', 'NLHead', 'GCHead', 'CCHead',
     'UPerHead', 'DepthwiseSeparableASPPHead', 'ANNHead', 'DAHead', 'OCRHead',
@@ -37,5 +40,6 @@ __all__ = [
     'PointHead', 'APCHead', 'DMHead', 'LRASPPHead', 'SETRUPHead',
     'SETRMLAHead', 'DPTHead', 'SETRMLAHead', 'SegmenterMaskTransformerHead',
     'SegformerHead', 'ISAHead', 'STDCHead', 'IterativeDecodeHead',
-    'KernelUpdateHead', 'KernelUpdator', 'LightHamHead','ATMSingleHeadSeg'
+    'KernelUpdateHead', 'KernelUpdator', 'LightHamHead','ATMSingleHeadSeg',
+    'BoundaryDecodeHead','CLIPClassificationHead'
 ]

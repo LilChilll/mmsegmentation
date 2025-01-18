@@ -19,7 +19,7 @@ import pdb
 from ..utils.tokenize import tokenize
 
 @MODELS.register_module()
-class OSZegCLIP(EncoderDecoder):
+class TSZegCLIP(EncoderDecoder):
 
     def __init__(self,
                  text_encoder,
@@ -35,11 +35,9 @@ class OSZegCLIP(EncoderDecoder):
                  ft_backbone=False,
                  exclude_key=None,
                  training = True,
-                 contrastive_learning_iter = 10000,
                  **args
                  ):
-        super(OSZegCLIP, self).__init__(auxiliary_head=auxiliary_head,**args)
-        self.training = training
+        super(TSZegCLIP, self).__init__(auxiliary_head=auxiliary_head,**args)
         self.base_class = np.asarray(base_class)
         self.novel_class = np.asarray(novel_class)
         self.both_class = np.asarray(both_class)
@@ -65,14 +63,11 @@ class OSZegCLIP(EncoderDecoder):
             # else:
             #     self.texts = self._get_multi_prompts(self.class_names)
         if training:
-            if self.backbone.attn_surgery:
-                self.backbone.apply_CLIP_attention_surgery()
             if prompt_learner is not None:
                 if self_training:
-                    prompt_learner.seen_idx = both_class
+                    prompt_learner.seen_idx = self.both_class
                 self.prompt_learner = MODELS.build(prompt_learner)
                 self.prompt_learner.init_context(self.text_encoder)
-                # self.prompt_learner.eval()
             else:
                 self.prompt_learner = None
             if len(self.base_class) != len(self.both_class): # zero-shot setting
@@ -83,10 +78,8 @@ class OSZegCLIP(EncoderDecoder):
                     self._visiable_mask_st(self.base_class, self.novel_class, self.both_class)
                     self._st_mask(self.base_class, self.novel_class, self.both_class)
             self._freeze_stages(self.text_encoder, exclude_key=exclude_key)
-            self._freeze_stages(self.prompt_learner)
             if ft_backbone is False:
                 self._freeze_stages(self.backbone, exclude_key=exclude_key)
-            # self._freeze_stages(self.decode_head)
             # if prompt_learner:
             #     # self._freeze_stages(self.prompt_learner)
             #     enabled = set()
@@ -101,14 +94,12 @@ class OSZegCLIP(EncoderDecoder):
             self.text_encoder.eval()
             self.backbone.eval()
             if prompt_learner!=None:
+                prompt_learner.seen_idx = self.both_class
                 self.prompt_learner = MODELS.build(prompt_learner)
                 self.prompt_learner.init_context(self.text_encoder)
                 self.prompt_learner.eval()
             else:
                 self.prompt_learner = None
-        self.register_buffer('_iter_counter', torch.tensor(0, device='cuda'))
-        self.contrastive_learning_iter=contrastive_learning_iter
-        self.start_contastive_learning = False
         
     def _freeze_stages(self, model, exclude_key=None):
         """Freeze stages param and norm stats."""
@@ -216,25 +207,20 @@ class OSZegCLIP(EncoderDecoder):
                                                         gt_semantic_seg,
                                                         self.train_cfg,
                                                         self.self_training,
-                                                        self.st_mask
-                                                        
+                                                        self.st_mask,
+                                                        image_encoder=self.backbone,
                                                         )
         else:
             loss_decode = self.decode_head.forward_train(feat, 
                                                         img_metas,
                                                         gt_semantic_seg,
                                                         self.train_cfg,
-                                                        self.self_training
-                                                    
+                                                        self.self_training,
+                                                        image_encoder=self.backbone,
                                                         )
         losses.update(add_prefix(loss_decode, 'decode'))
         return losses
 
-    def _cls_head_forward_train(self,logits,labels):
-        # losses = dict()
-        loss_cls = self.decode_head.forward_train(logits,labels)
-        # losses.update(add_prefix(loss_cls, 'logits'))
-        return loss_cls
     def _auxiliary_head_forward_train(self, feat, img_metas, gt_semantic_seg):
         """Run forward function and calculate loss for edge head in
         training."""
@@ -252,92 +238,34 @@ class OSZegCLIP(EncoderDecoder):
         text_embeddings = self.text_encoder(texts.to(img.device))
         text_embeddings = text_embeddings / text_embeddings.norm(dim=-1, keepdim=True)
         return text_embeddings
-    def forward_mask_img(self,img,img_metas,gt_semantic_seg):
+    def forward_train(self, img, img_metas, gt_semantic_seg):
+        # pdb.set_trace()
         bs = img.shape[0]
-        if self.training and len(self.base_class) != len(self.both_class): # zero setting
-            gt_semantic_seg = torch.Tensor(self.visibility_seen_mask).type_as(gt_semantic_seg)[gt_semantic_seg]
-        inputs = []
-        import cv2
-        # losses = dict()
-        losses = []
-        for img_i,gt_mask in zip(img,gt_semantic_seg):
-            gt_cls = gt_mask.unique()
-            gt_cls = gt_cls[(gt_cls != 255) & (gt_cls != -1)] 
-            masked_imgs=[]
-            labels_per_img = []
-            if len(gt_cls)==0:
-                masked_imgs=None
-            else:
-                for cls in gt_cls:
-                    labels_per_img.append(cls)
-                    binary_mask = (gt_mask==cls).float()
-                    binary_mask = binary_mask.expand_as(img_i)
-                    copy = img_i.clone() # [3,224,224]
-                    copy = copy * binary_mask
-                    masked_imgs.append(copy)
-                masked_imgs = torch.stack(masked_imgs)
-                labels_per_img = torch.stack(labels_per_img)
-            inputs.append({
-                "masked_imgs":masked_imgs,
-                "labels":labels_per_img})
-        valid_samples = [input_i for input_i in inputs if input_i["masked_imgs"] is not None]
-        if len(valid_samples)==0:
-            # If no valid samples, return a small non-zero loss
-            return {"loss_logits": torch.tensor(1e-6, device=img.device, requires_grad=True)}
-        for input_i in valid_samples:
-            img_i = input_i["masked_imgs"]
-            labels_i = input_i["labels"]
-            patch_tokens= self.extract_feat(img_i)
-            global_embedding = patch_tokens[-1][:,0,:]
-            text_features = self.prompt_learner(patch_tokens,self.text_encoder)
-            logit_scale = self.backbone.logit_scale.exp()
-            logits = []
-            for tfs_i, imf_i in zip(text_features, global_embedding):
-                l_i = logit_scale * imf_i @ tfs_i.t()
-                logits.append(l_i)
-            logits = torch.stack(logits)
-            
-            
-            loss_decode = self._cls_head_forward_train(logits, labels_i)
-            losses.append(loss_decode)
-        final_loss=dict()
-        final_loss.update({"loss_logits":torch.stack(losses).mean()})
-        return final_loss
-    def forward_seg(self, img, img_metas, gt_semantic_seg):
-        bs = img.shape[0]
+        global_embedding, visual_embedding, patch_tokens= self.extract_feat(img) #
         
-        patch_tokens= self.extract_feat(img) # global_embedding, visual_embedding, 
-        global_embedding = patch_tokens[-1][:,0,:]
-        visual_embedding = patch_tokens[-1][:,1:,:]
-        h=w = int(np.sqrt(visual_embedding.shape[1]))
-        visual_embedding = visual_embedding.reshape(bs, h, w, -1).permute(0, 3, 1, 2)
         feat= []
-        
-        # else:
-        if self.load_text_embedding:
-            text_feat_ori = np.load(self.load_text_embedding) # (c,512)
-            text_feat_ori = torch.from_numpy(text_feat_ori).to(img.device)
-            
+        if self.prompt_learner is not None:
+            text_feat = self.prompt_learner(patch_tokens,self.text_encoder)
         else:
-            if not self.multi_prompts:
-                text_feat_ori = self.text_embedding(self.texts, img)
+            if self.load_text_embedding:
+                text_feat = np.load(self.load_text_embedding) # (c,512)
+                text_feat = torch.from_numpy(text_feat).to(img.device)
+                
             else:
-                num_cls, num_prompts, _ = self.texts.size()
-                text_feat_ori = self.text_embedding(self.texts.reshape(num_cls*num_prompts, -1), img)
-                text_feat_ori = text_feat_ori.reshape(num_cls, num_prompts, -1).mean(dim=1)
-                text_feat_ori /= text_feat_ori.norm(dim=-1).unsqueeze(1)
+                if not self.multi_prompts:
+                    text_feat = self.text_embedding(self.texts, img)
+                else:
+                    num_cls, num_prompts, _ = self.texts.size()
+                    text_feat = self.text_embedding(self.texts.reshape(num_cls*num_prompts, -1), img)
+                    text_feat = text_feat.reshape(num_cls, num_prompts, -1).mean(dim=1)
+                    text_feat /= text_feat.norm(dim=-1).unsqueeze(1)
             if not self.self_training:
-                text_feat_ori = text_feat_ori[self.base_class, :]
-        # self.clip_feature_surgery(global_embedding,visual_embedding, text_feat)
-        
-        # if self._iter_counter>self.contrastive_learning_iter:
-        text_feat_prompt = self.prompt_learner(patch_tokens,self.text_encoder)
+                text_feat = text_feat[self.base_class, :]
+        self.clip_feature_surgery(global_embedding,visual_embedding, text_feat)
         feat.append(visual_embedding)
         feat.append(global_embedding)
-        # feat.append(text_feat_ori)
-        feat.append(text_feat_prompt)
-            
-        # feat.append(img)
+        feat.append(text_feat)
+        feat.append(img)
         
         losses = dict()
         loss_decode = self._decode_head_forward_train(feat, img_metas, gt_semantic_seg)
@@ -347,13 +275,8 @@ class OSZegCLIP(EncoderDecoder):
             loss_edge= self._auxiliary_head_forward_train(
                 patch_tokens, img_metas, gt_semantic_seg)
             losses.update(loss_edge)
-        self._iter_counter += 1
+
         return losses
-    def forward_train(self, img, img_metas, gt_semantic_seg):
-        # pdb.set_trace()
-        losses = self.forward_seg(img, img_metas, gt_semantic_seg)
-        return losses
-        
     def _decode_head_forward_test(self, x, img_metas, self_training):
         """Run forward function and calculate loss for decode head in
         inference."""
@@ -389,26 +312,22 @@ class OSZegCLIP(EncoderDecoder):
                 
         if self.prompt_learner is not None:
             text_feat = self.prompt_learner(patch_tokens,self.text_encoder)
-        # else:
-        if self.load_text_embedding:
-            text_feat_ori = np.load(self.load_text_embedding) # (c,512)
-            text_feat_ori = torch.from_numpy(text_feat_ori).to(img.device)
-            
         else:
-            if not self.multi_prompts:
-                text_feat_ori = self.text_embedding(self.texts, img)
+            if self.load_text_embedding:
+                text_feat = np.load(self.load_text_embedding) # (c,512)
+                text_feat = torch.from_numpy(text_feat).to(img.device)
             else:
-                num_cls, num_prompts, _ = self.texts.size()
-                text_feat_ori = self.text_embedding(self.texts.reshape(num_cls*num_prompts, -1), img)
-                text_feat_ori = text_feat_ori.reshape(num_cls, num_prompts, -1).mean(dim=1)
-                text_feat_ori /= text_feat_ori.norm(dim=-1).unsqueeze(1)
-            if not self.self_training:
-                text_feat_ori = text_feat_ori[self.base_class, :]
+                if not self.multi_prompts:
+                    text_feat = self.text_embedding(self.texts, img)
+                else:
+                    num_cls, num_prompts, _ = self.texts.size()
+                    text_feat = self.text_embedding(self.texts.reshape(num_cls*num_prompts, -1), img)
+                    text_feat = text_feat.reshape(num_cls, num_prompts, -1).mean(dim=1)
+                    text_feat /= text_feat.norm(dim=-1).unsqueeze(1)
         feat= []
         # pdb.set_trace()
         feat.append(visual_embedding)
         feat.append(global_embedding)
-        feat.append(text_feat_ori)
         feat.append(text_feat)
         out = self._decode_head_forward_test(feat, img_metas, self.self_training)
         out = resize(

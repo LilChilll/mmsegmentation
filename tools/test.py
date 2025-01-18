@@ -23,8 +23,8 @@ from mmseg.utils import build_ddp, build_dp, get_device, setup_multi_processes
 def parse_args():
     parser = argparse.ArgumentParser(
         description='mmseg test (and eval) a model')
-    parser.add_argument('config', help='test config file path')
-    parser.add_argument('checkpoint', help='checkpoint file')
+    parser.add_argument('--config', help='test config file path')
+    parser.add_argument('--checkpoint', help='checkpoint file')
     parser.add_argument(
         '--work-dir',
         help=('if specified, the evaluation metric results will be dumped'
@@ -111,7 +111,9 @@ def parse_args():
         warnings.warn('--options is deprecated in favor of --cfg-options. '
                       '--options will not be supported in version v0.22.0.')
         args.cfg_options = args.options
-
+    args.config ="./configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt.py"
+    args.checkpoint = None
+    args.eval ="mIoU"
     return args
 
 
@@ -212,25 +214,33 @@ def main():
     }
     # build the dataloader
     data_loader = build_dataloader(dataset, **test_loader_cfg)
-
+    
     # build the model and load checkpoint
+    cfg.model.training = False
     cfg.model.train_cfg = None
+    if cfg.model.get('prompt_learner', None):
+        cfg.model.prompt_learner['training'] = False
     model = build_segmentor(cfg.model, test_cfg=cfg.get('test_cfg'))
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
-    if 'CLASSES' in checkpoint.get('meta', {}):
-        model.CLASSES = checkpoint['meta']['CLASSES']
-    else:
-        print('"CLASSES" not found in meta, use dataset.CLASSES instead')
-        model.CLASSES = dataset.CLASSES
-    if 'PALETTE' in checkpoint.get('meta', {}):
-        model.PALETTE = checkpoint['meta']['PALETTE']
-    else:
-        print('"PALETTE" not found in meta, use dataset.PALETTE instead')
-        model.PALETTE = dataset.PALETTE
-
+    if model.backbone.attn_surgery:
+        model.backbone.apply_CLIP_attention_surgery()
+    # checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    if model.prompt_learner is not None:
+        model.prompt_learner.generate_prompts_for_testing(model.text_encoder)
+    # if 'CLASSES' in checkpoint.get('meta', {}):
+    #     model.CLASSES = checkpoint['meta']['CLASSES']
+    # else:
+    #     print('"CLASSES" not found in meta, use dataset.CLASSES instead')
+    #     model.CLASSES = dataset.CLASSES
+    # if 'PALETTE' in checkpoint.get('meta', {}):
+    #     model.PALETTE = checkpoint['meta']['PALETTE']
+    # else:
+    #     print('"PALETTE" not found in meta, use dataset.PALETTE instead')
+    #     model.PALETTE = dataset.PALETTE
+    seen_idx = cfg.model.base_class
+    unseen_idx = cfg.model.novel_class
     # clean gpu memory when starting a new evaluation.
     torch.cuda.empty_cache()
     eval_kwargs = {} if args.eval_options is None else args.eval_options
@@ -270,6 +280,7 @@ def main():
                 'Please use MMCV >= 1.4.4 for CPU training!'
         model = revert_sync_batchnorm(model)
         model = build_dp(model, cfg.device, device_ids=cfg.gpu_ids)
+        pre_eval=args.eval is not None and not eval_on_format_results
         results = single_gpu_test(
             model,
             data_loader,
@@ -277,7 +288,7 @@ def main():
             args.show_dir,
             False,
             args.opacity,
-            pre_eval=args.eval is not None and not eval_on_format_results,
+            pre_eval=pre_eval,
             format_only=args.format_only or eval_on_format_results,
             format_args=eval_kwargs)
     else:
@@ -308,7 +319,8 @@ def main():
             mmcv.dump(results, args.out)
         if args.eval:
             eval_kwargs.update(metric=args.eval)
-            metric = dataset.evaluate(results, **eval_kwargs)
+            # metric = dataset.evaluate(results, **eval_kwargs)
+            metric = dataset.evaluate(seen_idx, unseen_idx, results, **eval_kwargs) 
             metric_dict = dict(config=args.config, metric=metric)
             mmcv.dump(metric_dict, json_file, indent=4)
             if tmpdir is not None and eval_on_format_results:

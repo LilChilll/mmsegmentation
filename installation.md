@@ -36,14 +36,21 @@ pip install torch==1.10.1+cu111 torchvision==0.11.2+cu111 torchaudio==0.10.1 -f 
 
 ```
 # train model scripts
+config file list:
+    configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt.py
+    configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt_shape.py
+    configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt_PL.py
+    configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt_PL_shape.py
+    configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt_plain.py
+    configs/zegclip/sszegclip-20k_voc-512x512_zero_dppt_vpt.py
 ```bash
 # use all gpus
-bash tools/dist_train.sh configs/zegclip/sszegclip-20k_voc-512x512.py 2 --work-dir work_dirs/run2
+bash tools/dist_train.sh configs/zegclip/sszegclip-20k_voc-512x512.py 2 --work-dir work_dirs/run1
 # specify gpus
 CUDA_VISIBLE_DEVICES="1,2" bash tools/dist_train.sh configs/zegclip/sszegclip-20k_voc-512x512.py 2 --work-dir work_dirs/run1_zegclip_voc_zero
 ```
 # test model scripts
 ```bash
 # use all gpus
-python tools/test.py configs/zegclip/sszegclip-20k_voc-512x512.py --checkpoint work_dirs/run1/iter_20000.pth
+python tools/test.py configs/zegclip/sszegclip-20k_voc-512x512.py work_dirs/run1_zegclip_voc_zero/iter_20000.pth --eval mIoU
 ```

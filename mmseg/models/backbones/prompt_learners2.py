@@ -53,10 +53,9 @@ class MultiGranularityPromptLearner(nn.Module):
                  patch_size = 32,
                  N_CTX=4,
                  n_layers = 4,
-                 CTX_INIT = "a photo of a",
+                 CTX_INIT = None,
                  ensemble_prompts= False,
-                 training = True,
-                 pretrained = None
+                 training = True
                  ):
         super().__init__()
         self.training=training
@@ -71,14 +70,12 @@ class MultiGranularityPromptLearner(nn.Module):
         self.seen_idx = seen_idx
         self.all_idx = all_idx
         self.classnames = [name for i,name in enumerate(classnames) if i in seen_idx]
-
         self.all_classnames = classnames
         if self.training:
             self.n_cls =len(self.classnames)
         else:
             self.n_cls = len(self.all_classnames)
         self.ensemble_prompts = ensemble_prompts
-        self.pretrained = pretrained
         
 
 
@@ -86,7 +83,6 @@ class MultiGranularityPromptLearner(nn.Module):
         classnames = self.classnames
         input_dim =  self.input_dim
         prompt_embedding_dim=self.prompt_embedding_dim
-        ctx_dim = clip_model.ln_final.weight.shape[0]
         content_dim=self.content_dim
         patch_size = self.patch_size
         n_layers = self.n_layers
@@ -114,30 +110,13 @@ class MultiGranularityPromptLearner(nn.Module):
             self.register_buffer("tokenized_prompts", ensemble_prompts)  # n_templates,c,77
         else:
             if ctx_init:
-                # ctx_init = ctx_init.replace("_", " ")
-                # n_ctx = len(ctx_init.split(" "))
-                # prompt_prefix = ctx_init
-                 # use given words to initialize context vectors
                 ctx_init = ctx_init.replace("_", " ")
-                n_ctx = len(ctx_init.strip().split(" "))
-                self.n_ctx = n_ctx
-                prompt = tokenize(ctx_init).to(next(clip_model.parameters()).device)
-                with torch.no_grad():
-                    embedding = clip_model.token_embedding(prompt).type(dtype) # 1,77,512
-                ctx_vectors = embedding[0, 1 : 1 + n_ctx, :] # 4,512
+                self.n_ctx = len(ctx_init.split(" "))
                 prompt_prefix = ctx_init
             else:
-                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-                nn.init.normal_(ctx_vectors, std=0.02)
                 prompt_prefix = " ".join(["X"] * n_ctx)
-            
-            print(f'Initial context: "{prompt_prefix}"')
-            print(f"Number of context words (tokens): {n_ctx}")
-            self.prompt_prefix =  prompt_prefix
-            self.ctx = nn.Parameter(ctx_vectors) # n_ctx,512
-
+            self.prompt_prefix=prompt_prefix
             prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
             tokenized_prompts = torch.cat([tokenize(p) for p in prompts]) # c,77
             tokenized_prompts = tokenized_prompts.to(next(clip_model.parameters()).device)
             with torch.no_grad():
@@ -146,8 +125,6 @@ class MultiGranularityPromptLearner(nn.Module):
             self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS #c,60,512
             self.register_buffer("tokenized_prompts", tokenized_prompts)  # c,77
             
-
-        
         for i in range(n_ctx):
             style_projector = nn.Sequential(
                                     nn.Linear(input_dim*2, 512),  # 注意这里的input_dim应该是原特征维度的两倍
@@ -172,11 +149,15 @@ class MultiGranularityPromptLearner(nn.Module):
 
 
         self.dropout = Dropout(0.1)
+        
+        
 
-        # self.apply(self._init_weights)
+        
+        # self.dynamic_weights = nn.Parameter(torch.ones(n_layers, dtype=torch.float32), requires_grad=True)
+
+        self.apply(self._init_weights)
 
     def generate_prompts_for_testing(self,clip_model):
-
         prompts = [self.prompt_prefix + " " + name + "." for name in self.all_classnames]
         dtype = clip_model.dtype
         n_ctx = self.n_ctx
@@ -193,24 +174,8 @@ class MultiGranularityPromptLearner(nn.Module):
         self.token_prefix = new_token_prefix
         self.token_suffix = new_token_suffix
         self.tokenized_prompts = new_tokenized_prompts
-        print("Prompts adjusted.")
-        
-    def init_weights(self, pretrained=None):
-        pretrained = pretrained or self.pretrained
-        if isinstance(pretrained, str):
-            checkpoint = torch.load(pretrained, map_location='cpu')['state_dict']#.float().state_dict()
-            state_dict = {}
-            for k in checkpoint.keys():
-                if k.startswith('prompt_learner.'):
-                    new_k = k.replace('prompt_learner.', '')
-                    state_dict[new_k] = checkpoint[k]
-            u, _ = self.load_state_dict(state_dict, False)
-            print(f'pretrained prompt learner weight loaded.')
-            if len(u)>0:
-                print(f'{u} are misaligned params in image encoder')
-        elif pretrained==None:
-            self.apply(self._init_weights)
-            
+        print("prompts adjusted.")
+    
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             # trunc_normal_(m.weight, std=.02)
@@ -308,14 +273,21 @@ class MultiGranularityPromptLearner(nn.Module):
         """
         im_features = torch.stack(im_features,dim=0) # L,b,1024,512
         im_features = im_features.permute(1,0,3,2).contiguous() # b,L,512,1024
-        im_features = im_features[:,:,:,1:]
         # print(im_features.shape)
         bs,l,c,n = im_features.shape
         w = h=int(math.sqrt(n))
         assert w*h == n, "n should be a square number"
-
-        prefix = self.token_prefix  # c,1,512
-        suffix = self.token_suffix  # c,72,512
+        # prompt_prefix = "a photo of a {}."
+        # prompts = [prompt_prefix.format(name) for name in self.classnames]
+        # tokenized_prompts = torch.cat([tokenize(p) for p in prompts]) # c,77
+        # tokenized_prompts = tokenized_prompts.to(next(text_encoder.parameters()).device)
+        # with torch.no_grad():
+        #     class_embedding = text_encoder.token_embedding(tokenized_prompts).type(text_encoder.dtype) # c,77,512
+        #     token_prefix = class_embedding[:, :1, :]  # SOS # c,1,512
+        #     token_suffix = class_embedding[:, 1 + self.n_ctx:, :]  # CLS, EOS #c,60,512
+        prefix = self.token_prefix.expand(bs,-1,-1,-1) # bs,c,1,512
+        suffix = self.token_suffix.expand(bs,-1,-1,-1)  #bs,c,72,512
+        # n_templates = self.token_prefix.shape[1]
         content = []
         style_features = []
         content_features = []
@@ -324,44 +296,30 @@ class MultiGranularityPromptLearner(nn.Module):
             style_img_feat = self.prepare_style_img_feature(img_feat) 
             style_feat = self.compute_style_features(style_img_feat) # n_ctx,dim
             
-            # feature_token = style_feat.expand(self.n_cls,-1,-1).to(im_features.device) # c,n_ctx,dim
-            # style_features.append(feature_token)
-            style_features.append(style_feat)
+            feature_token = style_feat.expand(self.n_cls,-1,-1).to(im_features.device) # c,n_ctx,dim
+            style_features.append(feature_token)
 
             content_token = self.dropout(self.content_projector(img_feat.reshape(l,c,h,w)).to(im_features.device)) # 1,dim
             content_features.append(content_token)
 
-        style_features = torch.stack(style_features,dim=0) # b,n_ctx,dim
-        ctx = self.ctx.unsqueeze(0).to(im_features.device) # 1,n_ctx,dim
-        ctx_shifted = ctx+style_features # b,n_ctx,dim
+        style_features = torch.stack(style_features,dim=0) # b,c,n_ctx,dim
         # style_features,_ = style_features.max(dim=0) # c,n_ctx,dim
-        content_features = torch.stack(content_features,dim=0) # b,1,dim
-        # ensemble_prompts = torch.cat([
-        #     prefix,
-        #     style_features,
-        #     suffix
-        # ],
-        # dim=2) # bs,n_templates,c,77,512
-        prompts = []
-        for ctx_shifted_i in ctx_shifted:
-            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
-            pts_i  = torch.cat([
-                prefix,
-                ctx_i,
-                suffix
-            ],dim=1)
-            prompts.append(pts_i)
-        prompts = torch.stack(prompts)
-
+        content_features = torch.stack(content_features,dim=0) # b,dim
+        ensemble_prompts = torch.cat([
+            prefix,
+            style_features,
+            suffix
+        ],
+        dim=2) # bs,n_templates,c,77,512
         text_tokens = []
-        for pts_i, ctt_i in zip(prompts, content_features):
+        for pts_i, ctt_i in zip(ensemble_prompts, content_features):
             # pts_i :(c,77,512)
             # ctt_i :(1,512)
             text_features = text_encoder.forward_dynamic_prompts(pts_i, self.tokenized_prompts)            
             text_features = self.fusion_projector(ctt_i, text_features)
             text_tokens.append(text_features)
-        text_embedding = torch.stack(text_tokens, dim=0).to(im_features.device)  # b,c,512
-        text_embedding = text_embedding / text_embedding.norm(dim=-1, keepdim=True)  #b,c,512
+        text_embedding = torch.stack(text_tokens, dim=0).to(im_features.device)  # c,512
+        text_embedding = text_embedding / text_embedding.norm(dim=-1, keepdim=True)  # c,512
             
     
         return text_embedding

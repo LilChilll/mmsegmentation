@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
 from mmseg.models.builder import LOSSES
+from .utils import InverseNet
 # from .criterion import SegPlusCriterion
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from https://github.com/facebookresearch/detr/blob/master/models/detr.py
@@ -12,7 +13,7 @@ MaskFormer criterion.
 from .misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 
 import torch.distributed as dist
-
+import cv2
 def get_world_size() -> int:
     if not dist.is_available():
         return 1
@@ -76,27 +77,32 @@ def cosine_margin_loss(q, e, labels, tau=1.0, m=0.5):
     neg = torch.sum(neg, dim=-1) + m
     return 1 - torch.mean(torch.div(pos, neg))
 
-def contrastive_loss(logits, temperature=1.0):
-    # Compute cosine similarity scores
-    similarity_matrix = logits #F.cosine_similarity(image_embedding.unsqueeze(1), text_embedding.unsqueeze(0), dim=-1)
-    
-    # Compute softmax probabilities
-    softmax_probs = F.softmax(similarity_matrix / temperature, dim=-1)
-    
-    # Take diagonal elements as positive probabilities
-    positive_probs = torch.diag(softmax_probs)
-    
-    # Take maximum of each column (excluding diagonal) as negative probabilities
-    negative_probs = (torch.sum(softmax_probs, dim=0) - positive_probs) / (softmax_probs.size(0) - 1)
-    
-    # Compute negative log probabilities
-    neg_log_positive = -torch.log(positive_probs)
-    neg_log_negative = -torch.log(negative_probs)
-    
-    # Compute contrastive loss
-    loss = neg_log_positive.mean() + neg_log_negative.mean()
-    
-    return loss
+def contrastive_loss(visual_features,text_embeddings, temperature=0.5):
+    """
+    计算对比损失
+    :param visual_features: (B, C, D) 类别级别视觉特征
+    :param text_embeddings: (B, C, D) 类别级别文本嵌入
+    :return: 对比损失
+    """
+    B, C, D = visual_features.shape
+
+    # L2 归一化
+    visual_features = F.normalize(visual_features, dim=-1)  # (B, C, D)
+    text_embeddings = F.normalize(text_embeddings, dim=-1)  # (B, C, D)
+
+    # 计算相似度矩阵
+    similarity = torch.einsum('bcd,bcd->bc', visual_features, text_embeddings)  # (B, C)
+
+    # 正样本对的相似度
+    positive_similarity = torch.exp(similarity / temperature)  # (B, C)
+
+    # 所有负样本对的相似度
+    all_similarity = torch.exp(torch.einsum('bcd,bkd->bck', visual_features, text_embeddings) / temperature)  # (B, C, C)
+    negative_similarity = all_similarity.sum(dim=-1) - positive_similarity  # (B, C)
+
+    # 对比损失
+    loss = -torch.log(positive_similarity / (positive_similarity + negative_similarity))  # (B, C)
+    return loss.mean()
 
 
 class SegPlusCriterion(nn.Module):
@@ -107,7 +113,12 @@ class SegPlusCriterion(nn.Module):
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
-    def __init__(self, num_classes, weight_dict, losses, eos_coef=0.1,align_corners=False,cal_bg_loss=False):
+    def __init__(self, 
+                 num_classes, 
+                 weight_dict, 
+                 losses, 
+                 eos_coef=0.1,
+                 align_corners=False):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -125,9 +136,8 @@ class SegPlusCriterion(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
         self.align_corners = align_corners
-        self.cal_bg_loss = cal_bg_loss
-        self.num_bg_masks = 0
-        self.loss_map={"masks": self.loss_masks}
+        self.loss_map={"masks": self.loss_masks} # ,"contrastive":self.loss_contrastive
+        
 
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -184,29 +194,13 @@ class SegPlusCriterion(nn.Module):
         }
    
         return losses
-    def loss_logits(self, outputs, targets, indices, num_masks):
-        src_masks = outputs["prompt_pred_masks"]
-        # for text prompt tuning ce
-        # logits = outputs["logits"] # b,15
-        # target_labels = self._get_target_label_cross_entropy(src_masks, targets)
-        # for focal_loss            
-        target_masks = self._get_target_mask_binary_cross_entropy(src_masks, targets)
+    def loss_contrastive(self, outputs, targets, indices, num_masks):
 
-        bs, n_cls, H, W = target_masks.size()
-        _, _, H_, W_ = src_masks.size()
-        src_masks = src_masks.reshape(bs*n_cls, H_, W_)
-        target_masks = target_masks.reshape(bs*n_cls, H, W) # 624,512,512
-        # upsample predictions to the target size
-        src_masks = F.interpolate(
-            src_masks[:, None], size=target_masks.shape[-2:], mode="bilinear", align_corners=False 
-        )
-        src_masks = src_masks[:, 0].flatten(1)
-        target_masks = target_masks.flatten(1)
-        losses = {
-            "loss_prompt_mask": sigmoid_focal_loss(src_masks, target_masks, num_masks),
-            # "loss_logit": F.cross_entropy(logits,target_labels)
-        }
-        return losses
+        visual_features, text_embeddings = outputs["feature_pairs"]
+        total_loss = contrastive_loss(visual_features,text_embeddings,temperature=0.5)
+        return {"loss_contrastive": total_loss}
+    
+    
     def _get_target_label_cross_entropy(self,out_masks,targets):
         B, C = out_masks.size()[:2]
         target_labels =torch.zeros(B, C).to(out_masks.device) 
@@ -225,18 +219,18 @@ class SegPlusCriterion(nn.Module):
             idx = idx[mask!=255]
             target_masks_o[i, mask_o, idx] = 1
         return target_masks_o.reshape(B, C, H, W)
-    def _get_target_background_mask(self, out_masks,targets):
-        # 算前景
-        B, _ = out_masks.size()[:2] # b,1
+    
+    def _get_target_edge_attention_binary_cross_entropy(self, out_masks, targets):
+        B, C = out_masks.size()[:2]
         H, W = targets[0]['masks'].size()
-        target_masks_o = torch.zeros(B, 1, H*W).to(out_masks.device) 
+        target_masks_o = torch.zeros(B, C, H * W).to(out_masks.device) # bs,171,h*w
         for i, target in enumerate(targets):
             mask = target['masks'].long().reshape(-1)
-            idx = torch.arange(0, H*W, 1).long().to(out_masks.device) 
-            # mask_o = mask[mask==255]
-            idx = idx[mask!=255]  # 算前景
-            target_masks_o[i, 0, idx] = 1
-        return target_masks_o.reshape(B, 1, H, W)
+            idx = torch.arange(0, H * W, 1).long().to(out_masks.device)
+            mask_o = mask[mask != 255]
+            idx = idx[mask != 255]
+            target_masks_o[i, mask_o, idx] = 1  # 把gt中前景像素置全部为1，背景像素置为0
+        return target_masks_o.reshape(B, C, H, W)
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -284,9 +278,10 @@ class SegPlusCriterion(nn.Module):
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
 
-        if "prompt_pred_masks" in outputs:
-            # self.losses=["masks"]
-            self.loss_map.update({"prompt_tuning":self.loss_logits})
+        # if "prompt_pred_masks" in outputs:
+        #     # self.losses=["masks"]
+        #     self.loss_map.update({"prompt_tuning":self.loss_logits})
+
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
@@ -313,31 +308,23 @@ class SegLossPlus(nn.Module):
                  dec_layers,
                  mask_weight=20.0,
                  dice_weight=1.0,
-                 # logits_weight=None,
-                 prompt_mask_weight = None,
-                 # bg_loss_weight=None,
+                 constractive_weight=5.0,
                  loss_weight=1.0,
-                 align_corners = False,
-                 use_point=False):
+                 align_corners = False):
         super(SegLossPlus, self).__init__()
-        self.cal_bg_loss = False
-        weight_dict = {"loss_mask": mask_weight, "loss_dice": dice_weight}
-        losses = ["masks"]
-        if prompt_mask_weight:
-            weight_dict.update({"loss_prompt_mask":prompt_mask_weight})
-            losses.append("prompt_tuning")
+        weight_dict = {"loss_mask": mask_weight, "loss_dice": dice_weight} #,"loss_contrastive":constractive_weight
+        losses = ["masks"]#,"constractive"]
         
         aux_weight_dict = {}
         for i in range(dec_layers - 1):
             aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
-        
+        self.weight_dict = weight_dict
         self.criterion = SegPlusCriterion(
             num_classes,
             weight_dict=weight_dict,
             losses=losses,
-            align_corners=align_corners,
-            cal_bg_loss=self.cal_bg_loss
+            align_corners=align_corners
         )
         
         self.loss_weight = loss_weight
@@ -351,6 +338,9 @@ class SegLossPlus(nn.Module):
         
         self.ignore_index = ignore_index
         targets = self.prepare_targets(label)
+        # if "feature_pairs" in outputs:
+        #     self.criterion.losses.append("contrastive")
+
         losses = self.criterion(outputs, targets)
         # if not "logits" in outputs:
         #     self.criterion.weight_dict.pop("loss_logit")
@@ -366,12 +356,13 @@ class SegLossPlus(nn.Module):
 
     def prepare_targets(self, targets):
         new_targets = []
+        H,W = targets.size()[1:]
         for targets_per_image in targets:
             # gt_cls
             gt_cls = targets_per_image.unique()
-            bg_cls = gt_cls[gt_cls == self.ignore_index]
+            # bg_cls = gt_cls[gt_cls == self.ignore_index]
             gt_cls = gt_cls[gt_cls != self.ignore_index]
-           
+            
             masks = []
             for cls in gt_cls:
                 masks.append(targets_per_image == cls)
@@ -382,9 +373,8 @@ class SegLossPlus(nn.Module):
             out = {
                 "labels": gt_cls,
                 "target_masks": masks,
-                "masks": targets_per_image,
+                "masks": targets_per_image
             }
-            if self.cal_bg_loss:
-                out.update({"bg_labels":bg_cls})
             new_targets.append(out)
         return new_targets
+

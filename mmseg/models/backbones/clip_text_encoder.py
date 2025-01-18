@@ -46,7 +46,8 @@ class DynamicPromptCLIPTextEncoder(nn.Module):
                 layers=transformer_layers,
                 heads=transformer_heads,
                 attn_mask=self.build_attention_mask(),
-                design_details = {"n_ctx":n_ctx,"prompts_depth":prompts_depth}
+                design_details = {"n_ctx":n_ctx,"prompts_depth":prompts_depth},
+                is_text_encoder=True
             )
         else:
             self.compound_prompts_text = None
@@ -54,7 +55,8 @@ class DynamicPromptCLIPTextEncoder(nn.Module):
                 width=transformer_width,
                 layers=transformer_layers,
                 heads=transformer_heads,
-                attn_mask=self.build_attention_mask()
+                attn_mask=self.build_attention_mask(),
+                is_text_encoder=True
             )
 
     def init_weights(self, pretrained=None):
@@ -126,7 +128,7 @@ class DynamicPromptCLIPTextEncoder(nn.Module):
         deep_compound_prompts_text = self.compound_prompts_text
         # pdb.set_trace()
         if deep_compound_prompts_text is None:
-            x,_ = self.transformer(x)
+            x = self.transformer(x)
         else:
             x = self.transformer([x, deep_compound_prompts_text, 0])
         x = x.permute(1, 0, 2)  # LND -> NLD
